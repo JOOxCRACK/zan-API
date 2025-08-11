@@ -1,25 +1,26 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response
 import itertools, threading, json, secrets, datetime
-
 from faker import Faker
-fake = Faker()  # for exp & cvv
+
+fake = Faker()
 
 app = FastAPI(
     title="CC GEN PRV API @JOOxCRACK",
     description="BIN-based credit card generator",
-    version="1.1.0"
+    version="1.2.0"
 )
 
-CURRENT_BINS = []
+# In-memory store
+CURRENT_BINS: list[str] = []
 _lock = threading.Lock()
 _cycle = None
 _last_bin = None
 
-# Length hints (simple)
+# ---- Helpers ----
 BIN_LEN_HINT = {
     "34": 15, "37": 15,           # Amex
-    "4": 16,                       # Visa
+    "4": 16,                      # Visa
     "51": 16, "52": 16, "53": 16, "54": 16, "55": 16,  # MC
     "2": 16, "6011": 16, "65": 16 # Others (simplified)
 }
@@ -51,19 +52,20 @@ def cvv_len_for_bin(b: str) -> int:
     return 4 if b.startswith(("34", "37")) else 3
 
 def gen_exp_and_cvv_via_faker(b: str):
-    # exp with Faker: returns "MM|YY", split to pieces
     exp = fake.credit_card_expire(start="now", end="+5y", date_format="%m|%y")
     exp_m, exp_y = exp.split("|")
-    # cvv from Faker (3 or 4 based on brand hint)
     n = cvv_len_for_bin(b)
-    # faker.credit_card_security_code(card_type=None) -> 3 digits usually
-    # نضمن الطول n:
-    base = fake.credit_card_security_code()
+    base = fake.credit_card_security_code()  # usually 3 digits
     if len(base) < n:
         base = (base + "0"*n)[:n]
     elif len(base) > n:
         base = base[:n]
     return exp_m, exp_y, base
+
+def gen_one_line(b: str) -> str:
+    pan = gen_pan_from_bin(b, infer_len(b))
+    exp_m, exp_y, cvv = gen_exp_and_cvv_via_faker(b)
+    return f"{pan}|{exp_m}|{exp_y}|{cvv}"
 
 def _clean_bins(bins):
     out = []
@@ -77,6 +79,7 @@ def _reset_cycle():
     global _cycle
     _cycle = itertools.cycle(CURRENT_BINS) if CURRENT_BINS else None
 
+# ---- Pages & APIs ----
 @app.get("/", response_class=HTMLResponse)
 def upload_page():
     count = len(CURRENT_BINS)
@@ -87,17 +90,18 @@ def upload_page():
 <meta charset="utf-8">
 <title>CC GEN PRV API @JOOxCRACK</title>
 <style>
-body {{font-family: Arial, sans-serif;background:#0d1117;color:#c9d1d9;display:flex;flex-direction:column;align-items:center;padding:24px}}
-h1 {{color:#58a6ff;margin:0 0 16px}}
-.card {{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px;width:340px}}
-input,select,button {{width:100%;margin-top:10px;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
-button {{background:#238636;color:#fff;border:none;cursor:pointer}}
-button:hover {{background:#2ea043}}
-.small {{opacity:.8;margin-top:10px}}
+  body {{font-family: Arial, sans-serif;background:#0d1117;color:#c9d1d9;display:flex;flex-direction:column;align-items:center;padding:24px}}
+  h1 {{color:#58a6ff;margin:0 0 16px}}
+  .card {{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px;width:360px;margin-bottom:16px}}
+  input,select,button {{width:100%;margin-top:10px;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
+  button {{background:#238636;color:#fff;border:none;cursor:pointer}}
+  button:hover {{background:#2ea043}}
+  .row {{display:flex;gap:10px}}
 </style>
 </head>
 <body>
   <h1>CC GEN PRV API @JOOxCRACK</h1>
+
   <div class="card">
     <p>Loaded BINs: <b>{count}</b></p>
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -110,7 +114,28 @@ button:hover {{background:#2ea043}}
       </select>
       <button type="submit">Upload</button>
     </form>
-    <p class="small">Endpoints: <code>GET /generate</code> • <code>GET /bulk?per_bin=1000</code></p>
+  </div>
+
+  <div class="card">
+    <p>Quick actions</p>
+    <div class="row">
+      <a href="/generate" style="flex:1;text-decoration:none">
+        <button type="button" style="width:100%">Random Generate (1)</button>
+      </a>
+      <a href="/health" style="flex:1;text-decoration:none">
+        <button type="button" style="width:100%">Health</button>
+      </a>
+    </div>
+    <form action="/bulk" method="get" style="margin-top:10px">
+      <label>Bulk per BIN</label>
+      <input type="number" name="per_bin" value="1000" min="1">
+      <label>Shuffle</label>
+      <select name="shuffle">
+        <option value="true" selected>True</option>
+        <option value="false">False</option>
+      </select>
+      <button type="submit">Generate & Download (TXT)</button>
+    </form>
   </div>
 </body>
 </html>
@@ -162,18 +187,13 @@ def generate():
             b = next(_cycle)
         _last_bin = b
 
-    pan = gen_pan_from_bin(b, infer_len(b))
-    exp_m, exp_y, cvv = gen_exp_and_cvv_via_faker(b)
-    return f"{pan}|{exp_m}|{exp_y}|{cvv}"
-
-def gen_one_line(b: str) -> str:
-    pan = gen_pan_from_bin(b, infer_len(b))
-    exp_m, exp_y, cvv = gen_exp_and_cvv_via_faker(b)
-    return f"{pan}|{exp_m}|{exp_y}|{cvv}"
+    line = gen_one_line(b)
+    return line  # "CARD|MM|YY|CVV"
 
 @app.get("/bulk")
-def bulk(per_bin: int = 1000):
-    """Generate <per_bin> cards per BIN and download as a single TXT file."""
+def bulk(per_bin: int = 1000, shuffle: str = "true"):
+    """Generate <per_bin> cards per BIN and download as a single TXT file.
+       shuffle=true mixes all lines randomly across BINs."""
     with _lock:
         bins = CURRENT_BINS.copy()
     if not bins:
@@ -190,13 +210,17 @@ def bulk(per_bin: int = 1000):
             seen.add(pan)
             lines.append(line)
 
+    do_shuffle = str(shuffle).lower() in ("1", "true", "yes", "on")
+    if do_shuffle and len(lines) > 1:
+        for i in range(len(lines) - 1, 0, -1):
+            j = secrets.randbelow(i + 1)
+            lines[i], lines[j] = lines[j], lines[i]
+
     content = "\n".join(lines) + "\n"
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"cards_{len(bins)}bins_{per_bin}per_{ts}.txt"
-    return Response(content, media_type="text/plain",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
-    pan = gen_card_number(b, infer_len(b))
-    exp_m, exp_y, cvv = gen_exp_and_cvv(b)
-    return f"{pan}|{exp_m}|{exp_y}|{cvv}"
+    filename = f"cards_{len(bins)}bins_{per_bin}per_{'shuf_' if do_shuffle else ''}{ts}.txt"
+    return Response(
+        content,
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
+    )
