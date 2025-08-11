@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>رفع BINs</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <h1>رفع BINs</h1>
+    <p>المسجّل حاليًا: <b>{{ count }}</b> BIN(s)</p>
+    <form action="/admin/upload" method="post" enctype="multipart/form-data" class="card">
+      <label>ملف (JSON / TXT / CSV)</label>
+      <input type="file" name="file" required />
+      <label>النمط</label>
+      <select name="mode">
+        <option value="replace">استبدال</option>
+        <option value="append">إضافة</option>
+      </select>
+      <button type="submit">رفع</button>
+    </form>
+
+    <div class="card">
+      <h2>التوليد (API منفصل)</h2>
+      <code>POST /api/generate</code>
+      <pre>{
+  "count": 5,
+  "no_consecutive_repeat": true
+}</pre>
+      <p>الصحة: <code>GET /api/health</code></p>
+    </div>
+  </div>
+</body>
+</html>
