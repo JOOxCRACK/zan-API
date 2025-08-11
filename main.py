@@ -1,30 +1,28 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response
 import itertools, threading, json, secrets, datetime
-from faker import Faker
-
-fake = Faker()
 
 app = FastAPI(
     title="CC GEN PRV API @JOOxCRACK",
     description="BIN-based credit card generator",
-    version="1.2.0"
+    version="1.3.0"
 )
 
-# In-memory store
+# In-memory BINs store
 CURRENT_BINS: list[str] = []
 _lock = threading.Lock()
 _cycle = None
 _last_bin = None
 
-# ---- Helpers ----
+# Brand length hints
 BIN_LEN_HINT = {
-    "34": 15, "37": 15,           # Amex
-    "4": 16,                      # Visa
+    "34": 15, "37": 15,            # Amex
+    "4": 16,                       # Visa
     "51": 16, "52": 16, "53": 16, "54": 16, "55": 16,  # MC
-    "2": 16, "6011": 16, "65": 16 # Others (simplified)
+    "2": 16, "6011": 16, "65": 16  # Others (simplified)
 }
 
+# ---------- Luhn + helpers ----------
 def infer_len(b: str) -> int:
     for p in sorted(BIN_LEN_HINT.keys(), key=len, reverse=True):
         if b.startswith(p):
@@ -51,20 +49,19 @@ def gen_pan_from_bin(bin_str: str, length: int) -> str:
 def cvv_len_for_bin(b: str) -> int:
     return 4 if b.startswith(("34", "37")) else 3
 
-def gen_exp_and_cvv_via_faker(b: str):
-    exp = fake.credit_card_expire(start="now", end="+5y", date_format="%m|%y")
-    exp_m, exp_y = exp.split("|")
+def gen_exp_and_cvv(b: str):
+    # Exp: 01..12 / (current_year+1 .. +5)
+    now = datetime.datetime.utcnow()
+    month = secrets.randbelow(12) + 1
+    year = (now.year + secrets.choice([1, 2, 3, 4, 5])) % 100
+    exp_m, exp_y = f"{month:02d}", f"{year:02d}"
     n = cvv_len_for_bin(b)
-    base = fake.credit_card_security_code()  # usually 3 digits
-    if len(base) < n:
-        base = (base + "0"*n)[:n]
-    elif len(base) > n:
-        base = base[:n]
-    return exp_m, exp_y, base
+    cvv = "".join(str(secrets.randbelow(10)) for _ in range(n))
+    return exp_m, exp_y, cvv
 
 def gen_one_line(b: str) -> str:
     pan = gen_pan_from_bin(b, infer_len(b))
-    exp_m, exp_y, cvv = gen_exp_and_cvv_via_faker(b)
+    exp_m, exp_y, cvv = gen_exp_and_cvv(b)
     return f"{pan}|{exp_m}|{exp_y}|{cvv}"
 
 def _clean_bins(bins):
@@ -79,7 +76,7 @@ def _reset_cycle():
     global _cycle
     _cycle = itertools.cycle(CURRENT_BINS) if CURRENT_BINS else None
 
-# ---- Pages & APIs ----
+# ---------- UI ----------
 @app.get("/", response_class=HTMLResponse)
 def upload_page():
     count = len(CURRENT_BINS)
@@ -97,6 +94,7 @@ def upload_page():
   button {{background:#238636;color:#fff;border:none;cursor:pointer}}
   button:hover {{background:#2ea043}}
   .row {{display:flex;gap:10px}}
+  a {{text-decoration:none}}
 </style>
 </head>
 <body>
@@ -119,12 +117,8 @@ def upload_page():
   <div class="card">
     <p>Quick actions</p>
     <div class="row">
-      <a href="/generate" style="flex:1;text-decoration:none">
-        <button type="button" style="width:100%">Random Generate (1)</button>
-      </a>
-      <a href="/health" style="flex:1;text-decoration:none">
-        <button type="button" style="width:100%">Health</button>
-      </a>
+      <a href="/generate" style="flex:1"><button type="button" style="width:100%">Random Generate (1)</button></a>
+      <a href="/health" style="flex:1"><button type="button" style="width:100%">Health</button></a>
     </div>
     <form action="/bulk" method="get" style="margin-top:10px">
       <label>Bulk per BIN</label>
@@ -141,6 +135,7 @@ def upload_page():
 </html>
 """
 
+# ---------- Upload / Health ----------
 @app.post("/upload")
 async def upload_bins(file: UploadFile = File(...), mode: str = Form("replace")):
     content = await file.read()
@@ -173,9 +168,10 @@ async def upload_bins(file: UploadFile = File(...), mode: str = Form("replace"))
 def health():
     return {"ok": True, "bins_count": len(CURRENT_BINS)}
 
+# ---------- One-by-one ----------
 @app.get("/generate", response_class=PlainTextResponse)
 def generate():
-    """One card per request, rotates BINs (no consecutive same BIN if possible)."""
+    """One card per request; rotates BINs to avoid consecutive duplicates."""
     global _last_bin
     with _lock:
         if not CURRENT_BINS:
@@ -187,13 +183,13 @@ def generate():
             b = next(_cycle)
         _last_bin = b
 
-    line = gen_one_line(b)
-    return line  # "CARD|MM|YY|CVV"
+    return gen_one_line(b)  # "CARD|MM|YY|CVV"
 
+# ---------- Bulk TXT (shuffled by default) ----------
 @app.get("/bulk")
 def bulk(per_bin: int = 1000, shuffle: str = "true"):
-    """Generate <per_bin> cards per BIN and download as a single TXT file.
-       shuffle=true mixes all lines randomly across BINs."""
+    """Generate <per_bin> cards per BIN and download TXT.
+       shuffle=true mixes all lines across BINs."""
     with _lock:
         bins = CURRENT_BINS.copy()
     if not bins:
