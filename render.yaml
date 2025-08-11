@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: bin-gen-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DB_PATH
+        value: "bins.db"  # لو فعلت Persistent Disk
+    disk:
+      name: data
+      mountPath: /
+      sizeGB: 1
