@@ -4,8 +4,8 @@ import secrets, datetime, io, json
 
 app = FastAPI(
     title="CC GEN PRV API @JOOxCRACK",
-    description="BIN-based card generator (Luhn-valid with tuned AMEX/body constraints)",
-    version="2.3.0"
+    description="BIN-based card generator (Luhn-valid, tuned AMEX, strong randomness)",
+    version="2.4.0"
 )
 
 # ===== Brand length hints =====
@@ -37,8 +37,12 @@ def luhn_check_digit(num_wo_check: str) -> str:
         total += d
     return str((10 - (total % 10)) % 10)
 
-# ===== “Realistic” body constraints =====
-BAD_TRIPLES = {"000", "123", "111", "222", "333", "444", "555", "666", "777", "888", "999"}
+# ===== randomness helpers (no visible patterns) =====
+def _rand_digit(avoid_zero=False) -> str:
+    d = secrets.randbelow(10)
+    while avoid_zero and d == 0:
+        d = secrets.randbelow(10)
+    return str(d)
 
 def _has_repeat(s: str, k: int) -> bool:
     run = 1
@@ -57,78 +61,69 @@ def _has_sequence(s: str, k: int) -> bool:
         if inc or dec: return True
     return False
 
-def _weighted_digit(nonzero_bias: bool = False) -> str:
-    # قلّل احتمال 0 عشان الشكل مايبقاش "ميت"
-    pool = "0123456789"
-    weights = [1, 3, 3, 3, 3, 3, 3, 3, 3, 3]  # 0 وزن 1، باقي الأرقام وزن 3
-    if nonzero_bias:
-        weights[0] = 0  # أول رقم في الجسم مش صفر
-    total = sum(weights)
-    r = secrets.randbelow(total)
-    acc = 0
-    for d, w in zip(pool, weights):
-        acc += w
-        if r < acc:
-            return d
-    return "0"
-
-def _gen_amex_body(body_len: int) -> str:
-    # جسم AMEX مقيَّد عشان يطلع شكل “حي”
-    tries = 0
-    while tries < 2000:
-        tries += 1
+def _gen_body_generic(n: int) -> str:
+    # قوي وعشوائي، مع منع سلاسل/تكرارات طويلة
+    while True:
         digits = []
-        for pos in range(body_len):
-            d = _weighted_digit(nonzero_bias=(pos == 0))
-            if pos >= 2 and d == digits[-1] == digits[-2]:
-                # امنع 3 متتالي أثناء البناء
-                for _ in range(10):
-                    d2 = _weighted_digit()
-                    if d2 != d:
-                        d = d2; break
+        for i in range(n):
+            d = _rand_digit(avoid_zero=(i == 0))  # أول خانة مش صفر
+            # منع 3 متتالي أثناء البناء
+            if i >= 2 and d == digits[-1] == digits[-2]:
+                alt = _rand_digit()
+                tries = 0
+                while alt == d and tries < 10:
+                    alt = _rand_digit()
+                    tries += 1
+                d = alt
             digits.append(d)
         s = "".join(digits)
-        if s[0] == "0": 
+        if _has_repeat(s, 4):  # 4 متتالي كثير
             continue
-        if _has_repeat(s, 3): 
+        if _has_sequence(s, 5):  # 12345 أو 98765
             continue
-        if _has_sequence(s, 4): 
-            continue
-        tail = s[-6:] if len(s) >= 6 else s
-        bad = False
-        for i in range(0, max(0, len(tail)-2)):
-            if tail[i:i+3] in BAD_TRIPLES:
-                bad = True; break
-        if bad:
+        if len(s) >= 4 and s[-4:] == "0000":
             continue
         return s
-    # fallback نادر
-    return "".join(_weighted_digit(nonzero_bias=(i == 0)) for i in range(body_len))
+
+def _gen_body_amex(n: int) -> str:
+    # AMEX: نفس فكرة الجينيريك لكن أشد شوية عشان مايبانش “ميت”
+    while True:
+        digits = []
+        for i in range(n):
+            # قلّل صفر، وخلي أول رقم أبعد عن 0
+            d = _rand_digit(avoid_zero=(i == 0))
+            # امنع 3 متتالي
+            if i >= 2 and d == digits[-1] == digits[-2]:
+                alt = _rand_digit()
+                tries = 0
+                while alt == d and tries < 10:
+                    alt = _rand_digit()
+                    tries += 1
+                d = alt
+            digits.append(d)
+        s = "".join(digits)
+        if _has_repeat(s, 3):
+            continue
+        if _has_sequence(s, 4):
+            continue
+        # ذيل آخر 6: امنع أنماط شائعة “ميتة”
+        tail = s[-6:] if len(s) >= 6 else s
+        bad = any(tail[i:i+3] in {"000","111","222","333","444","555","666","777","888","999","123","321"}
+                  for i in range(0, max(0, len(tail)-2)))
+        if bad:
+            continue
+        if len(s) >= 3 and s[-3:] == "000":
+            continue
+        return s
 
 def gen_pan_from_bin(bin_str: str, total_len: int) -> str:
     if len(bin_str) >= total_len:
-        # BIN أطول من الطول النهائي (مثلاً AMEX=15)
         raise ValueError(f"BIN '{bin_str}' too long for length {total_len}")
     body_len = total_len - len(bin_str) - 1
-
-    if bin_str.startswith(("34", "37")) and total_len == 15:
-        body = _gen_amex_body(body_len)
+    if bin_str.startswith(("34","37")) and total_len == 15:
+        body = _gen_body_amex(body_len)
     else:
-        # باقي البراندات بقيود أخف
-        tries = 0
-        while True:
-            tries += 1
-            body = "".join(_weighted_digit(nonzero_bias=(i == 0)) for i in range(body_len))
-            if body[0] == "0":
-                continue
-            if _has_repeat(body, 4):
-                continue
-            if _has_sequence(body, 5):
-                continue
-            break
-            if tries > 2000:
-                break
-
+        body = _gen_body_generic(body_len)
     partial = bin_str + body
     return partial + luhn_check_digit(partial)
 
@@ -138,7 +133,7 @@ def gen_exp_and_cvv(bin_str: str):
     year_yy = (now.year + secrets.choice([1,2,3,4,5])) % 100  # YY
     exp_m, exp_y = f"{month:02d}", f"{year_yy:02d}"
     n = cvv_len_for_bin(bin_str)
-    cvv = "".join(str(secrets.randbelow(10)) for _ in range(n))
+    cvv = "".join(_rand_digit() for _ in range(n))
     return exp_m, exp_y, cvv
 
 def gen_one_line(bin_str: str) -> str:
@@ -151,7 +146,6 @@ def clean_bins(lines):
     out = []
     for b in lines or []:
         digits = "".join(ch for ch in str(b).strip() if ch.isdigit())
-        # نقبل 5..12 فقط (BIN/IIN نموذجي)
         if digits and 5 <= len(digits) <= 12 and digits not in out:
             out.append(digits)
     return out
@@ -182,7 +176,7 @@ def index():
       <label>Cards per BIN</label>
       <input type="number" name="count" value="1000" min="1" required>
       <button type="submit">Generate & Download (TXT)</button>
-      <p class="muted">Format: <code>CARD|MM|YY|CVV</code> • AMEX = 15-digit PAN & 4-digit CVV</p>
+      <p class="muted">Format: <code>CARD|MM|YY|CVV</code> • AMEX=15 digits & CVV=4</p>
     </form>
   </div>
 </div></body></html>
@@ -194,7 +188,6 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
     raw = await file.read()
     name = (file.filename or "").lower()
 
-    # Parse file (TXT or JSON array)
     try:
         if name.endswith(".json"):
             data = json.loads(raw.decode("utf-8"))
@@ -212,23 +205,23 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
     lines = []
     for b in bins:
         seen = set()
-        needed = count
-        while needed > 0:
+        need = count
+        while need > 0:
             try:
-                line = gen_one_line(b)  # قد يرمي لو BIN أطول من الطول النهائي
+                line = gen_one_line(b)
             except ValueError:
-                break  # BIN غير صالح لطوله بالنسبة للبراند (مثلاً AMEX)
+                break  # BIN أطول من الطول المطلوب (مثلاً AMEX)
             pan = line.split("|", 1)[0]
             if pan in seen:
                 continue
             seen.add(pan)
             lines.append(line)
-            needed -= 1
+            need -= 1
 
     if not lines:
         raise HTTPException(400, "All BINs were invalid for their target lengths.")
 
-    # Shuffle (Fisher–Yates مع secrets)
+    # Shuffle قوي (Fisher–Yates بـ secrets)
     for i in range(len(lines) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         lines[i], lines[j] = lines[j], lines[i]
