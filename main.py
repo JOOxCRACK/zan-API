@@ -4,8 +4,8 @@ import secrets, datetime, io, json
 
 app = FastAPI(
     title="CC GEN PRV API @JOOxCRACK",
-    description="BIN-based card generator (Luhn-valid with proper AMEX handling)",
-    version="2.2.0"
+    description="BIN-based card generator (Luhn-valid with tuned AMEX/body constraints)",
+    version="2.3.0"
 )
 
 # ===== Brand length hints =====
@@ -37,12 +37,98 @@ def luhn_check_digit(num_wo_check: str) -> str:
         total += d
     return str((10 - (total % 10)) % 10)
 
+# ===== “Realistic” body constraints =====
+BAD_TRIPLES = {"000", "123", "111", "222", "333", "444", "555", "666", "777", "888", "999"}
+
+def _has_repeat(s: str, k: int) -> bool:
+    run = 1
+    for i in range(1, len(s)):
+        run = run + 1 if s[i] == s[i-1] else 1
+        if run >= k:
+            return True
+    return False
+
+def _has_sequence(s: str, k: int) -> bool:
+    if len(s) < k: return False
+    for i in range(len(s)-k+1):
+        chunk = s[i:i+k]
+        inc = all(int(chunk[j+1]) - int(chunk[j]) == 1 for j in range(k-1))
+        dec = all(int(chunk[j]) - int(chunk[j+1]) == 1 for j in range(k-1))
+        if inc or dec: return True
+    return False
+
+def _weighted_digit(nonzero_bias: bool = False) -> str:
+    # قلّل احتمال 0 عشان الشكل مايبقاش "ميت"
+    pool = "0123456789"
+    weights = [1, 3, 3, 3, 3, 3, 3, 3, 3, 3]  # 0 وزن 1، باقي الأرقام وزن 3
+    if nonzero_bias:
+        weights[0] = 0  # أول رقم في الجسم مش صفر
+    total = sum(weights)
+    r = secrets.randbelow(total)
+    acc = 0
+    for d, w in zip(pool, weights):
+        acc += w
+        if r < acc:
+            return d
+    return "0"
+
+def _gen_amex_body(body_len: int) -> str:
+    # جسم AMEX مقيَّد عشان يطلع شكل “حي”
+    tries = 0
+    while tries < 2000:
+        tries += 1
+        digits = []
+        for pos in range(body_len):
+            d = _weighted_digit(nonzero_bias=(pos == 0))
+            if pos >= 2 and d == digits[-1] == digits[-2]:
+                # امنع 3 متتالي أثناء البناء
+                for _ in range(10):
+                    d2 = _weighted_digit()
+                    if d2 != d:
+                        d = d2; break
+            digits.append(d)
+        s = "".join(digits)
+        if s[0] == "0": 
+            continue
+        if _has_repeat(s, 3): 
+            continue
+        if _has_sequence(s, 4): 
+            continue
+        tail = s[-6:] if len(s) >= 6 else s
+        bad = False
+        for i in range(0, max(0, len(tail)-2)):
+            if tail[i:i+3] in BAD_TRIPLES:
+                bad = True; break
+        if bad:
+            continue
+        return s
+    # fallback نادر
+    return "".join(_weighted_digit(nonzero_bias=(i == 0)) for i in range(body_len))
+
 def gen_pan_from_bin(bin_str: str, total_len: int) -> str:
     if len(bin_str) >= total_len:
-        # BIN too long for target length (e.g., AMEX 15)
+        # BIN أطول من الطول النهائي (مثلاً AMEX=15)
         raise ValueError(f"BIN '{bin_str}' too long for length {total_len}")
     body_len = total_len - len(bin_str) - 1
-    body = "".join(str(secrets.randbelow(10)) for _ in range(body_len))
+
+    if bin_str.startswith(("34", "37")) and total_len == 15:
+        body = _gen_amex_body(body_len)
+    else:
+        # باقي البراندات بقيود أخف
+        tries = 0
+        while True:
+            tries += 1
+            body = "".join(_weighted_digit(nonzero_bias=(i == 0)) for i in range(body_len))
+            if body[0] == "0":
+                continue
+            if _has_repeat(body, 4):
+                continue
+            if _has_sequence(body, 5):
+                continue
+            break
+            if tries > 2000:
+                break
+
     partial = bin_str + body
     return partial + luhn_check_digit(partial)
 
@@ -65,7 +151,7 @@ def clean_bins(lines):
     out = []
     for b in lines or []:
         digits = "".join(ch for ch in str(b).strip() if ch.isdigit())
-        # accept 5..12 only (typical BIN/IIN range); avoid overly long "bins"
+        # نقبل 5..12 فقط (BIN/IIN نموذجي)
         if digits and 5 <= len(digits) <= 12 and digits not in out:
             out.append(digits)
     return out
@@ -129,10 +215,9 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
         needed = count
         while needed > 0:
             try:
-                line = gen_one_line(b)  # may raise if BIN too long for brand length
+                line = gen_one_line(b)  # قد يرمي لو BIN أطول من الطول النهائي
             except ValueError:
-                # Skip invalid BIN for its brand length (e.g., AMEX with BIN >= 15)
-                break
+                break  # BIN غير صالح لطوله بالنسبة للبراند (مثلاً AMEX)
             pan = line.split("|", 1)[0]
             if pan in seen:
                 continue
@@ -143,7 +228,7 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
     if not lines:
         raise HTTPException(400, "All BINs were invalid for their target lengths.")
 
-    # Shuffle (Fisher–Yates with secrets)
+    # Shuffle (Fisher–Yates مع secrets)
     for i in range(len(lines) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         lines[i], lines[j] = lines[j], lines[i]
