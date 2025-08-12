@@ -1,89 +1,140 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
-import random
-from datetime import datetime
-import io
+import secrets, datetime, io
 
 app = FastAPI()
 
-# خوارزمية Luhn للتأكد من صلاحية الكروت
-def luhn_checksum(card_number):
-    def digits_of(n):
-        return [int(d) for d in str(n)]
-    digits = digits_of(card_number)
-    odd_digits = digits[-1::-2]
-    even_digits = digits[-2::-2]
-    checksum = sum(odd_digits)
-    for d in even_digits:
-        checksum += sum(digits_of(d * 2))
-    return checksum % 10
+# ---- Brand rules ----
+BIN_LEN_HINT = {
+    "34": 15, "37": 15,      # AMEX
+    "4": 16,                  # Visa
+    "51": 16, "52": 16, "53": 16, "54": 16, "55": 16,  # MC
+    "2": 16, "6011": 16, "65": 16                      # others (simplified)
+}
 
-def generate_luhn(bin_input):
-    while True:
-        card = bin_input + ''.join(str(random.randint(0, 9)) for _ in range(15 - len(bin_input)))
-        check_digit = [str(d) for d in range(10) if luhn_checksum(card + str(d)) == 0]
-        if check_digit:
-            return card + check_digit[0]
+def infer_len(bin_str: str) -> int:
+    for p in sorted(BIN_LEN_HINT.keys(), key=len, reverse=True):
+        if bin_str.startswith(p):
+            return BIN_LEN_HINT[p]
+    return 16
 
-def generate_card(bin_input):
-    card_number = generate_luhn(bin_input)
-    exp_month = f"{random.randint(1, 12):02}"
-    exp_year = str(random.randint(datetime.now().year + 1, datetime.now().year + 5))
-    cvv = f"{random.randint(100, 999)}"
-    return f"{card_number}|{exp_month}|{exp_year}|{cvv}"
+def cvv_len_for_bin(bin_str: str) -> int:
+    return 4 if bin_str.startswith(("34","37")) else 3  # AMEX=4, else=3
 
+# ---- Luhn ----
+def luhn_check_digit(num_wo_check: str) -> str:
+    digits = [int(d) for d in num_wo_check]
+    total, parity = 0, len(digits) % 2
+    for i, d in enumerate(digits):
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return str((10 - (total % 10)) % 10)
+
+def gen_pan_from_bin(bin_str: str, total_len: int) -> str:
+    body_len = total_len - len(bin_str) - 1
+    body = "".join(str(secrets.randbelow(10)) for _ in range(body_len))
+    partial = bin_str + body
+    return partial + luhn_check_digit(partial)
+
+def gen_exp_and_cvv(bin_str: str):
+    now = datetime.datetime.utcnow()
+    month = secrets.randbelow(12) + 1
+    year_yy = (now.year + secrets.choice([1,2,3,4,5])) % 100  # YY
+    exp_m, exp_y = f"{month:02d}", f"{year_yy:02d}"
+    n = cvv_len_for_bin(bin_str)
+    cvv = "".join(str(secrets.randbelow(10)) for _ in range(n))
+    return exp_m, exp_y, cvv
+
+def clean_bins(lines):
+    out = []
+    for b in lines or []:
+        digits = "".join(ch for ch in b.strip() if ch.isdigit())
+        if digits and 5 <= len(digits) <= 12 and digits not in out:
+            out.append(digits)
+    return out
+
+def gen_one_line(bin_str: str) -> str:
+    pan = gen_pan_from_bin(bin_str, infer_len(bin_str))
+    m, y, cvv = gen_exp_and_cvv(bin_str)
+    return f"{pan}|{m}|{y}|{cvv}"
+
+# ---- UI ----
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
-    <html>
-    <head>
-        <title>CC GEN PRV API @JOOxCRACK</title>
-        <style>
-            body{{font-family:Arial,Helvetica,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;justify-content:center}}
-            .wrap{{max-width:480px;margin:24px;padding:0 8px;width:100%}}
-            h1{{color:#58a6ff;margin:0 0 12px}}
-            .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;margin:12px 0}}
-            label{{display:block;margin:6px 0}}
-            input,button{{width:100%;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
-            button{{background:#238636;color:#fff;border:none;cursor:pointer;margin-top:10px}}
-            button:hover{{background:#2ea043}}
-        </style>
-    </head>
-    <body>
-        <div class="wrap">
-            <h1>CC GEN PRV API @JOOxCRACK</h1>
-            <div class="card">
-                <form action="/generate" enctype="multipart/form-data" method="post">
-                    <label>Upload BIN file</label>
-                    <input type="file" name="file" required>
-                    <label>Cards per BIN</label>
-                    <input type="number" name="count" value="10" min="1" required>
-                    <button type="submit">Generate & Download</button>
-                </form>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CC GEN PRV API @JOOxCRACK</title>
+<style>
+ body{{font-family:Arial,Helvetica,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;justify-content:center}}
+ .wrap{{max-width:480px;margin:24px;padding:0 8px;width:100%}}
+ h1{{color:#58a6ff;margin:0 0 12px}}
+ .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;margin:12px 0}}
+ label{{display:block;margin:6px 0}}
+ input,button{{width:100%;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
+ button{{background:#238636;color:#fff;border:none;cursor:pointer;margin-top:10px}}
+ button:hover{{background:#2ea043}}
+</style></head>
+<body><div class="wrap">
+  <h1>CC GEN PRV API @JOOxCRACK</h1>
+  <div class="card">
+    <form action="/generate" enctype="multipart/form-data" method="post">
+      <label>Upload BIN file (TXT/JSON)</label>
+      <input type="file" name="file" required>
+      <label>Cards per BIN</label>
+      <input type="number" name="count" value="10" min="1" required>
+      <button type="submit">Generate & Download</button>
+    </form>
+  </div>
+</div></body></html>
+"""
 
+# ---- Generate & download ----
 @app.post("/generate")
 async def generate(file: UploadFile = File(...), count: int = Form(...)):
     content = await file.read()
-    bins = content.decode().splitlines()
-    cards = []
+    name = (file.filename or "").lower()
 
-    for bin_val in bins:
-        bin_val = bin_val.strip()
-        if not bin_val.isdigit() or len(bin_val) < 6:
-            continue
-        for _ in range(count):
-            cards.append(generate_card(bin_val))
+    try:
+        if name.endswith(".json"):
+            import json
+            data = json.loads(content.decode("utf-8"))
+            if not isinstance(data, list):
+                raise ValueError("JSON must be an array of BIN strings.")
+            bins = clean_bins(data)
+        else:
+            bins = clean_bins(content.decode("utf-8", errors="ignore").splitlines())
+    except Exception as e:
+        raise HTTPException(400, f"File parse error: {e}")
 
-    # خلط الكروت بشكل عشوائي
-    random.shuffle(cards)
+    if not bins:
+        raise HTTPException(400, "No valid BINs in file (expect 5–12 digits each).")
 
-    # إنشاء ملف للتحميل
-    output = io.StringIO("\n".join(cards))
-    filename = "cards.txt"
-    return StreamingResponse(io.BytesIO(output.getvalue().encode()), media_type="text/plain",
-                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    lines = []
+    for b in bins:
+        seen = set()
+        needed = count
+        while needed > 0:
+            line = gen_one_line(b)  # CARD|MM|YY|CVV (AMEX will have 4-digit CVV)
+            pan = line.split("|", 1)[0]
+            if pan in seen:
+                continue
+            seen.add(pan)
+            lines.append(line)
+            needed -= 1
+
+    # shuffle all mixed together
+    for i in range(len(lines) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        lines[i], lines[j] = lines[j], lines[i]
+
+    buf = io.StringIO("\n".join(lines) + "\n")
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"cards_{len(bins)}bins_{count}per_{ts}.txt"
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode()),
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
