@@ -4,8 +4,8 @@ import secrets, datetime, io, json
 
 app = FastAPI(
     title="CC GEN PRV API @JOOxCRACK",
-    description="BIN-based card generator (Luhn-valid, tuned AMEX, strong randomness)",
-    version="2.4.0"
+    description="BIN-based card generator (Luhn-valid, AMEX handled)",
+    version="3.0.0"
 )
 
 # ===== Brand length hints =====
@@ -32,12 +32,11 @@ def luhn_check_digit(num_wo_check: str) -> str:
     for i, d in enumerate(digits):
         if i % 2 == parity:
             d *= 2
-            if d > 9:
-                d -= 9
+            if d > 9: d -= 9
         total += d
     return str((10 - (total % 10)) % 10)
 
-# ===== randomness helpers (no visible patterns) =====
+# ===== Random bodies (to avoid “dead” patterns) =====
 def _rand_digit(avoid_zero=False) -> str:
     d = secrets.randbelow(10)
     while avoid_zero and d == 0:
@@ -48,8 +47,7 @@ def _has_repeat(s: str, k: int) -> bool:
     run = 1
     for i in range(1, len(s)):
         run = run + 1 if s[i] == s[i-1] else 1
-        if run >= k:
-            return True
+        if run >= k: return True
     return False
 
 def _has_sequence(s: str, k: int) -> bool:
@@ -62,57 +60,49 @@ def _has_sequence(s: str, k: int) -> bool:
     return False
 
 def _gen_body_generic(n: int) -> str:
-    # قوي وعشوائي، مع منع سلاسل/تكرارات طويلة
     while True:
-        digits = []
+        digs = []
         for i in range(n):
-            d = _rand_digit(avoid_zero=(i == 0))  # أول خانة مش صفر
-            # منع 3 متتالي أثناء البناء
-            if i >= 2 and d == digits[-1] == digits[-2]:
-                alt = _rand_digit()
-                tries = 0
-                while alt == d and tries < 10:
+            d = _rand_digit(avoid_zero=(i == 0))
+            if i >= 2 and d == digs[-1] == digs[-2]:
+                # avoid 3 in a row
+                for _ in range(10):
                     alt = _rand_digit()
-                    tries += 1
-                d = alt
-            digits.append(d)
-        s = "".join(digits)
-        if _has_repeat(s, 4):  # 4 متتالي كثير
+                    if alt != d:
+                        d = alt; break
+            digs.append(d)
+        s = "".join(digs)
+        if _has_repeat(s, 4):  # 4 same in a row
             continue
-        if _has_sequence(s, 5):  # 12345 أو 98765
+        if _has_sequence(s, 5):  # 12345/98765
             continue
-        if len(s) >= 4 and s[-4:] == "0000":
+        if s.endswith("0000"):
             continue
         return s
 
 def _gen_body_amex(n: int) -> str:
-    # AMEX: نفس فكرة الجينيريك لكن أشد شوية عشان مايبانش “ميت”
+    # tougher filters to look “alive”
     while True:
-        digits = []
+        digs = []
         for i in range(n):
-            # قلّل صفر، وخلي أول رقم أبعد عن 0
             d = _rand_digit(avoid_zero=(i == 0))
-            # امنع 3 متتالي
-            if i >= 2 and d == digits[-1] == digits[-2]:
-                alt = _rand_digit()
-                tries = 0
-                while alt == d and tries < 10:
+            if i >= 2 and d == digs[-1] == digs[-2]:
+                for _ in range(10):
                     alt = _rand_digit()
-                    tries += 1
-                d = alt
-            digits.append(d)
-        s = "".join(digits)
+                    if alt != d:
+                        d = alt; break
+            digs.append(d)
+        s = "".join(digs)
         if _has_repeat(s, 3):
             continue
         if _has_sequence(s, 4):
             continue
-        # ذيل آخر 6: امنع أنماط شائعة “ميتة”
         tail = s[-6:] if len(s) >= 6 else s
         bad = any(tail[i:i+3] in {"000","111","222","333","444","555","666","777","888","999","123","321"}
-                  for i in range(0, max(0, len(tail)-2)))
+                  for i in range(max(0, len(tail)-2)))
         if bad:
             continue
-        if len(s) >= 3 and s[-3:] == "000":
+        if s.endswith("000"):
             continue
         return s
 
@@ -150,7 +140,7 @@ def clean_bins(lines):
             out.append(digits)
     return out
 
-# ===== UI (single page) =====
+# ===== Single-page UI =====
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -162,7 +152,7 @@ def index():
  h1{{color:#58a6ff;margin:0 0 12px}}
  .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;margin:12px 0}}
  label{{display:block;margin:6px 0}}
- input,button{{width:100%;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
+ input,button,select{{width:100%;padding:10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}}
  button{{background:#238636;color:#fff;border:none;cursor:pointer;margin-top:10px}}
  button:hover{{background:#2ea043}}
  .muted{{opacity:.8}}
@@ -175,6 +165,11 @@ def index():
       <input type="file" name="file" required>
       <label>Cards per BIN</label>
       <input type="number" name="count" value="1000" min="1" required>
+      <label>Shuffle</label>
+      <select name="shuffle">
+        <option value="true" selected>True</option>
+        <option value="false">False</option>
+      </select>
       <button type="submit">Generate & Download (TXT)</button>
       <p class="muted">Format: <code>CARD|MM|YY|CVV</code> • AMEX=15 digits & CVV=4</p>
     </form>
@@ -184,7 +179,7 @@ def index():
 
 # ===== Generate & download =====
 @app.post("/generate")
-async def generate(file: UploadFile = File(...), count: int = Form(...)):
+async def generate(file: UploadFile = File(...), count: int = Form(...), shuffle: str = Form("true")):
     raw = await file.read()
     name = (file.filename or "").lower()
 
@@ -210,7 +205,7 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
             try:
                 line = gen_one_line(b)
             except ValueError:
-                break  # BIN أطول من الطول المطلوب (مثلاً AMEX)
+                break  # BIN أطول من الطول النهائي المطلوب (مثلاً AMEX)
             pan = line.split("|", 1)[0]
             if pan in seen:
                 continue
@@ -221,16 +216,21 @@ async def generate(file: UploadFile = File(...), count: int = Form(...)):
     if not lines:
         raise HTTPException(400, "All BINs were invalid for their target lengths.")
 
-    # Shuffle قوي (Fisher–Yates بـ secrets)
-    for i in range(len(lines) - 1, 0, -1):
-        j = secrets.randbelow(i + 1)
-        lines[i], lines[j] = lines[j], lines[i]
+    # Shuffle if requested
+    if str(shuffle).lower() in ("1", "true", "yes", "on"):
+        for i in range(len(lines) - 1, 0, -1):
+            j = secrets.randbelow(i + 1)
+            lines[i], lines[j] = lines[j], lines[i]
 
     buf = io.StringIO("\n".join(lines) + "\n")
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"cards_{len(bins)}bins_{count}per_{ts}.txt"
+    filename = f"cards_{len(bins)}bins_{count}per_{'shuf_' if str(shuffle).lower() in ('1','true','yes','on') else ''}{ts}.txt"
     return StreamingResponse(
         io.BytesIO(buf.getvalue().encode()),
         media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
     )
+
+@app.get("/health")
+def health():
+    return {"ok": True}
